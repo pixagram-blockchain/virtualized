@@ -3,7 +3,7 @@
   "description": "React components for efficiently rendering large, scrollable lists and tabular data. v9.22.1 OPTIMIZED BY PIXAGRAM.",
   "author": "Brian Vaughn <brian.david.vaughn@gmail.com>, Matias Affolter",
   "user": "bvaughn",
-  "version": "10.0.0",
+  "version": "10.0.1",
   "homepage": "https://github.com/pixagram-blockchain/virtualized",
   "main": "dist/commonjs/index.js",
   "module": "dist/es/index.js",

@@ -114,9 +114,28 @@ class Masonry extends React.PureComponent<Props, State> {
   _styleCache: Map<number, CachedCellStyle> = new Map();
   _styleCacheRowDirection: string = 'ltr';
 
+  // Latest scroll offset, updated on every scroll event. Renders read this
+  // (in uncontrolled mode) so that scroll events which do not change the
+  // rendered cell range can skip setState entirely: absolutely-positioned
+  // cells inside the fixed-height inner container scroll natively without
+  // any React work.
+  _scrollTop: number = 0;
+  // Signature of the cell range produced by the last render:
+  // [start, stop, count] of the overscanned position-cache window, plus
+  // whether the render mounted a measurement batch.
+  _renderedRangeStart: number = -1;
+  _renderedRangeStop: number = -1;
+  _renderedRangeCount: number = -1;
+
+  // While `isScrolling`, rendered cell elements are reused by key so that
+  // a render triggered by a range change only invokes `cellRenderer` for
+  // cells entering the window (mirrors Grid's cell cache).
+  _cellCache: Map<mixed, React.Node> = new Map();
+
   clearCellPositions() {
     this._positionCache = new PositionCache();
     this._styleCache.clear();
+    this._cellCache.clear();
     this.forceUpdate();
   }
 
@@ -142,6 +161,7 @@ class Masonry extends React.PureComponent<Props, State> {
 
     this._positionCache = new PositionCache();
     this._styleCache.clear();
+    this._cellCache.clear();
     this._populatePositionCache(0, stopIndex);
 
     this.forceUpdate();
@@ -204,9 +224,14 @@ class Masonry extends React.PureComponent<Props, State> {
       rowDirection,
     } = this.props;
 
-    const {isScrolling, scrollTop} = this.state;
+    const {isScrolling} = this.state;
+    const scrollTop = this._getScrollTop();
 
     const children = [];
+    let rangeStart = -1;
+    let rangeStop = -1;
+    let rangeCount = 0;
+    const cellCache = this._cellCache;
 
     const estimateTotalHeight = this._getEstimatedTotalHeight();
 
@@ -219,6 +244,7 @@ class Masonry extends React.PureComponent<Props, State> {
     if (this._styleCacheRowDirection !== rowDirection) {
       // Cached styles are keyed on the opposite offset property; drop them.
       this._styleCache.clear();
+      this._cellCache.clear();
       this._styleCacheRowDirection = rowDirection;
     }
     const styleCache = this._styleCache;
@@ -234,6 +260,22 @@ class Masonry extends React.PureComponent<Props, State> {
         } else {
           startIndex = Math.min(startIndex, index);
           stopIndex = Math.max(stopIndex, index);
+        }
+        if (rangeStart === -1 || index < rangeStart) {
+          rangeStart = index;
+        }
+        if (index > rangeStop) {
+          rangeStop = index;
+        }
+        rangeCount++;
+
+        const cellKey = keyMapper(index);
+        if (isScrolling) {
+          const cachedElement = cellCache.get(cellKey);
+          if (cachedElement !== undefined) {
+            children.push(cachedElement);
+            return;
+          }
         }
 
         const cellHeight = cellMeasurerCache.getHeight(index);
@@ -266,17 +308,23 @@ class Masonry extends React.PureComponent<Props, State> {
           });
         }
 
-        children.push(
-          cellRenderer({
-            index,
-            isScrolling,
-            key: keyMapper(index),
-            parent: this,
-            style: cellStyle,
-          }),
-        );
+        const element = cellRenderer({
+          index,
+          isScrolling,
+          key: cellKey,
+          parent: this,
+          style: cellStyle,
+        });
+        if (isScrolling) {
+          cellCache.set(cellKey, element);
+        }
+        children.push(element);
       },
     );
+
+    this._renderedRangeStart = rangeStart;
+    this._renderedRangeStop = rangeStop;
+    this._renderedRangeCount = rangeCount;
 
     // We need to measure additional cells for this layout
     if (
@@ -384,10 +432,21 @@ class Masonry extends React.PureComponent<Props, State> {
   }
 
   _debounceResetIsScrollingCallback = () => {
+    this._cellCache.clear();
     this.setState({
       isScrolling: false,
+      scrollTop: this._getScrollTop(),
     });
   };
+
+  // In controlled mode (scrollTop prop, e.g. under WindowScroller) the
+  // offset flows through getDerivedStateFromProps into state; otherwise the
+  // instance field tracks the live DOM offset.
+  _getScrollTop(): number {
+    return this.props.scrollTop !== undefined
+      ? this.state.scrollTop
+      : this._scrollTop;
+  }
 
   _getEstimatedTotalHeight() {
     const {cellCount, cellMeasurerCache, width} = this.props;
@@ -406,7 +465,7 @@ class Masonry extends React.PureComponent<Props, State> {
 
   _invokeOnScrollCallback() {
     const {height, onScroll} = this.props;
-    const {scrollTop} = this.state;
+    const scrollTop = this._getScrollTop();
 
     if (this._onScrollMemoized !== scrollTop) {
       onScroll({
@@ -478,17 +537,71 @@ class Masonry extends React.PureComponent<Props, State> {
     // Prevent pointer events from interrupting a smooth scroll
     this._debounceResetIsScrolling();
 
-    // Certain devices (like Apple touchpad) rapid-fire duplicate events.
-    // Don't force a re-render if this is the case.
-    // The mouse may move faster then the animation frame does.
-    // Use requestAnimationFrame to avoid over-updating.
-    if (this.state.scrollTop !== scrollTop) {
-      this.setState({
-        isScrolling: true,
-        scrollTop,
-      });
+    if (this._scrollTop === scrollTop && this.state.isScrolling) {
+      return;
     }
+    this._scrollTop = scrollTop;
+
+    // The onScroll prop fires for every distinct offset, independent of
+    // whether React work is needed (memoized inside).
+    this._invokeOnScrollCallback();
+
+    // Re-render only when it would change the output: the overscanned cell
+    // range moved, a measurement batch is required, or the isScrolling flag
+    // needs to flip on. Offsets within the current range scroll natively.
+    if (
+      this.state.isScrolling &&
+      !this._rangeChanged(scrollTop) &&
+      !this._needsMeasurementBatch(scrollTop)
+    ) {
+      return;
+    }
+
+    this.setState({
+      isScrolling: true,
+      scrollTop,
+    });
   };
+
+  // Recomputes the overscanned range signature for `scrollTop` and compares
+  // it with what the last render produced. A position-cache walk costs well
+  // under a microsecond, so this runs on every scroll event.
+  _rangeChanged(scrollTop: number): boolean {
+    const {height, overscanByPixels} = this.props;
+
+    let start = -1;
+    let stop = -1;
+    let count = 0;
+    this._positionCache.range(
+      Math.max(0, scrollTop - overscanByPixels),
+      height + overscanByPixels * 2,
+      index => {
+        if (start === -1 || index < start) {
+          start = index;
+        }
+        if (index > stop) {
+          stop = index;
+        }
+        count++;
+      },
+    );
+
+    return (
+      start !== this._renderedRangeStart ||
+      stop !== this._renderedRangeStop ||
+      count !== this._renderedRangeCount
+    );
+  }
+
+  _needsMeasurementBatch(scrollTop: number): boolean {
+    const {cellCount, height, overscanByPixels} = this.props;
+
+    return (
+      this._positionCache.shortestColumnSize <
+        scrollTop + height + overscanByPixels &&
+      this._positionCache.count < cellCount
+    );
+  }
 }
 
 function identity(value) {

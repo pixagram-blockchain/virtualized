@@ -147,6 +147,10 @@ export default class ScalingCellSizeAndPositionManager {
     this._cellSizeAndPositionManager.resetCell(index);
   }
 
+  resizeCell(index: number): void {
+    this._cellSizeAndPositionManager.resizeCell(index);
+  }
+
   _getOffsetPercentage({
     containerSize,
     offset, // safe

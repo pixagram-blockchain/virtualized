@@ -7,28 +7,31 @@ const EMPTY_U32 = new Uint32Array(0);
 const EMPTY_U8 = new Uint8Array(0);
 
 const MIN_CAPACITY = 64;
+const MIN_COLUMN_CAPACITY = 32;
 
 // Position cache requirements:
 //   O(log(n) + k) lookup of cells to render for a given viewport size
 //   O(1) lookup of shortest measured column (so we know when to enter phase 1)
 //
-// This implementation replaces the previous interval tree with flat
-// TypedArrays:
+// A masonry layout is a set of independent column stacks, so instead of one
+// global geometry structure this cache keeps one top-sorted index array per
+// column:
 //
 //   - `_tops` / `_lefts` / `_heights` store each cell's geometry, indexed
 //     directly by cell index (cells arrive mostly sequentially).
-//   - `_order` keeps cell indices sorted by their `top` coordinate. Masonry
-//     layouts grow downward, so insertions are almost always appends and the
-//     occasional out-of-order insert is a single `copyWithin` (memmove).
-//   - Range queries binary-search `_order` and scan the narrow band of cells
-//     whose tops fall within `[lo - maxCellHeight, hi]`; any intersecting
-//     cell must start in that window. The scan is a contiguous, branch-light
-//     walk over typed memory instead of pointer chasing through tree nodes.
+//   - Each column (identified by its x offset) owns a Uint32Array of its
+//     cell indices sorted by `top`. Masonry grows downward per column, so
+//     inserts are O(1) amortized appends; rare out-of-order inserts are a
+//     single `copyWithin` within that column only.
+//   - Range queries binary-search each column independently and walk the
+//     narrow per-column band `[lo - columnMaxCellHeight, hi]`. Queries are
+//     output-sensitive — O(columns * log n + reported) — and one giant cell
+//     only widens the candidate band of its own column.
 //
-// Unlike the interval tree (which silently accumulated duplicate entries if
-// the same index was positioned twice), `setPosition` now overwrites the
-// previous position for an index. This avoids duplicate render callbacks
-// (and duplicate React keys) when a range is re-populated.
+// Unlike the original interval tree (which silently accumulated duplicate
+// entries if the same index was positioned twice), `setPosition` overwrites
+// the previous position for an index. This avoids duplicate render
+// callbacks (and duplicate React keys) when a range is re-populated.
 export default class PositionCache {
   _capacity = 0;
   _count = 0;
@@ -38,19 +41,16 @@ export default class PositionCache {
   _heights: Float64Array = EMPTY_F64;
   _flags: Uint8Array = EMPTY_U8;
 
-  // Cell indices sorted by ascending `top`; only the first `_count`
-  // entries are meaningful.
-  _order: Uint32Array = EMPTY_U32;
-
-  // Upper bound for the height of any cell ever inserted; used to bound
-  // the candidate band during range queries.
-  _maxCellHeight = 0;
-
-  // Tracks the bottom edge of each column. Parallel arrays beat a Map for
-  // realistic column counts (a handful): the lookup is a short linear scan
-  // over a Float64Array instead of a hash on every insert.
+  // Column registry, keyed by x offset. Parallel arrays beat a Map for
+  // realistic column counts (a handful): lookup is a short linear scan.
   _colLefts: Float64Array = new Float64Array(8);
   _colBottoms: Float64Array = new Float64Array(8);
+  // Per-column sorted cell indices (ascending top) and their counts.
+  _colOrders: Array<Uint32Array> = [];
+  _colItemCounts: Uint32Array = new Uint32Array(8);
+  // Per-column monotone upper bound on cell height; bounds the candidate
+  // band during range queries.
+  _colMaxHeights: Float64Array = new Float64Array(8);
   _colCount = 0;
 
   // Cached column metrics, recomputed lazily.
@@ -71,50 +71,57 @@ export default class PositionCache {
   }
 
   // Render all cells visible within the viewport range defined.
-  // Cells are reported in ascending order of their `top` coordinate.
+  // Cells are reported column by column, in ascending `top` order within
+  // each column.
   range(
     scrollTop: number,
     clientHeight: number,
     renderCallback: RenderCallback,
   ): void {
-    const count = this._count;
     const hi = scrollTop + clientHeight;
 
-    if (count === 0 || scrollTop > hi) {
+    if (this._count === 0 || scrollTop > hi) {
       return;
     }
 
-    const order = this._order;
     const tops = this._tops;
     const lefts = this._lefts;
     const heights = this._heights;
+    const colCount = this._colCount;
 
-    // First cell whose top could still produce an intersection:
-    // any intersecting cell satisfies top >= lo - maxCellHeight.
-    const minTop = scrollTop - this._maxCellHeight;
-
-    // Lower bound binary search over `order` by top.
-    let low = 0;
-    let high = count;
-    while (low < high) {
-      const mid = (low + high) >>> 1;
-      if (tops[order[mid]] < minTop) {
-        low = mid + 1;
-      } else {
-        high = mid;
+    for (let c = 0; c < colCount; c++) {
+      const n = this._colItemCounts[c];
+      if (n === 0) {
+        continue;
       }
-    }
+      const order = this._colOrders[c];
 
-    for (let k = low; k < count; k++) {
-      const index = order[k];
-      const top = tops[index];
+      // First cell whose top could still produce an intersection in this
+      // column: any intersecting cell satisfies top >= lo - colMaxHeight.
+      const minTop = scrollTop - this._colMaxHeights[c];
 
-      if (top > hi) {
-        break;
+      let low = 0;
+      let high = n;
+      while (low < high) {
+        const mid = (low + high) >>> 1;
+        if (tops[order[mid]] < minTop) {
+          low = mid + 1;
+        } else {
+          high = mid;
+        }
       }
 
-      if (top + heights[index] >= scrollTop) {
-        renderCallback(index, lefts[index], top);
+      for (let k = low; k < n; k++) {
+        const index = order[k];
+        const top = tops[index];
+
+        if (top > hi) {
+          break;
+        }
+
+        if (top + heights[index] >= scrollTop) {
+          renderCallback(index, lefts[index], top);
+        }
       }
     }
   }
@@ -123,15 +130,13 @@ export default class PositionCache {
     this._ensureCapacity(index + 1);
 
     const tops = this._tops;
-    const order = this._order;
     const wasSet = this._flags[index] === 1;
 
     if (wasSet) {
-      // Overwrite: remove the stale entry from the sorted order first.
-      const oldTop = tops[index];
-      const oldPos = this._findOrderPosition(index, oldTop);
-      if (oldPos !== -1) {
-        order.copyWithin(oldPos, oldPos + 1, this._count);
+      // Overwrite: remove the stale entry from its previous column first.
+      const oldColumn = this._findColumn(this._lefts[index]);
+      if (oldColumn !== -1) {
+        this._removeFromColumn(oldColumn, index, tops[index]);
         this._count--;
       }
     }
@@ -141,54 +146,20 @@ export default class PositionCache {
     this._heights[index] = height;
     this._flags[index] = 1;
 
-    if (height > this._maxCellHeight) {
-      this._maxCellHeight = height;
+    let c = this._findColumn(left);
+    if (c === -1) {
+      c = this._addColumn(left);
     }
 
-    // Insert `index` into `order`, keeping it sorted by top (upper bound,
-    // so equal tops preserve insertion order). Masonry grows downward, so
-    // this is nearly always an append.
-    const count = this._count;
-    if (count === 0 || tops[order[count - 1]] <= top) {
-      order[count] = index;
-    } else {
-      let low = 0;
-      let high = count;
-      while (low < high) {
-        const mid = (low + high) >>> 1;
-        if (tops[order[mid]] <= top) {
-          low = mid + 1;
-        } else {
-          high = mid;
-        }
-      }
-      order.copyWithin(low + 1, low, count);
-      order[low] = index;
+    if (height > this._colMaxHeights[c]) {
+      this._colMaxHeights[c] = height;
     }
-    this._count = count + 1;
+
+    this._insertIntoColumn(c, index, top);
+    this._count++;
 
     const bottom = top + height;
-    const colLefts = this._colLefts;
-    const colCount = this._colCount;
-    let c = 0;
-    for (; c < colCount; c++) {
-      if (colLefts[c] === left) {
-        break;
-      }
-    }
-    if (c === colCount) {
-      if (colCount === colLefts.length) {
-        const nextLefts = new Float64Array(colCount << 1);
-        const nextBottoms = new Float64Array(colCount << 1);
-        nextLefts.set(colLefts);
-        nextBottoms.set(this._colBottoms);
-        this._colLefts = nextLefts;
-        this._colBottoms = nextBottoms;
-      }
-      this._colLefts[c] = left;
-      this._colBottoms[c] = bottom;
-      this._colCount = colCount + 1;
-    } else if (bottom > this._colBottoms[c]) {
+    if (bottom > this._colBottoms[c]) {
       this._colBottoms[c] = bottom;
     }
     this._columnMetricsDirty = true;
@@ -229,16 +200,88 @@ export default class PositionCache {
     this._columnMetricsDirty = false;
   }
 
-  // Locates `index` inside the sorted `_order` array given its current top.
-  // Binary-searches to the run of equal tops, then scans it.
-  _findOrderPosition(index: number, top: number): number {
-    const order = this._order;
-    const tops = this._tops;
-    const count = this._count;
+  _findColumn(left: number): number {
+    const colLefts = this._colLefts;
+    const colCount = this._colCount;
+    for (let c = 0; c < colCount; c++) {
+      if (colLefts[c] === left) {
+        return c;
+      }
+    }
+    return -1;
+  }
 
-    // Lower bound of the run of entries with this top.
+  _addColumn(left: number): number {
+    const c = this._colCount;
+    if (c === this._colLefts.length) {
+      const nextSize = c << 1;
+      const nextLefts = new Float64Array(nextSize);
+      const nextBottoms = new Float64Array(nextSize);
+      const nextItemCounts = new Uint32Array(nextSize);
+      const nextMaxHeights = new Float64Array(nextSize);
+      nextLefts.set(this._colLefts);
+      nextBottoms.set(this._colBottoms);
+      nextItemCounts.set(this._colItemCounts);
+      nextMaxHeights.set(this._colMaxHeights);
+      this._colLefts = nextLefts;
+      this._colBottoms = nextBottoms;
+      this._colItemCounts = nextItemCounts;
+      this._colMaxHeights = nextMaxHeights;
+    }
+    this._colLefts[c] = left;
+    this._colBottoms[c] = 0;
+    this._colItemCounts[c] = 0;
+    this._colMaxHeights[c] = 0;
+    this._colOrders[c] = EMPTY_U32;
+    this._colCount = c + 1;
+    return c;
+  }
+
+  // Inserts `index` into column `c`, keeping its order sorted by top
+  // (upper bound, so equal tops preserve insertion order). Masonry grows
+  // downward per column, so this is nearly always an append.
+  _insertIntoColumn(c: number, index: number, top: number): void {
+    let order = this._colOrders[c];
+    const n = this._colItemCounts[c];
+
+    if (n === order.length) {
+      const next = new Uint32Array(
+        n === 0 ? MIN_COLUMN_CAPACITY : n << 1,
+      );
+      next.set(order);
+      order = next;
+      this._colOrders[c] = next;
+    }
+
+    const tops = this._tops;
+    if (n === 0 || tops[order[n - 1]] <= top) {
+      order[n] = index;
+    } else {
+      let low = 0;
+      let high = n;
+      while (low < high) {
+        const mid = (low + high) >>> 1;
+        if (tops[order[mid]] <= top) {
+          low = mid + 1;
+        } else {
+          high = mid;
+        }
+      }
+      order.copyWithin(low + 1, low, n);
+      order[low] = index;
+    }
+    this._colItemCounts[c] = n + 1;
+  }
+
+  // Locates and removes `index` from column `c` given its current top.
+  // Binary-searches to the run of equal tops, then scans it.
+  _removeFromColumn(c: number, index: number, top: number): void {
+    const order = this._colOrders[c];
+    const n = this._colItemCounts[c];
+    const tops = this._tops;
+
     let low = 0;
-    let high = count;
+    let high = n;
     while (low < high) {
       const mid = (low + high) >>> 1;
       if (tops[order[mid]] < top) {
@@ -248,44 +291,45 @@ export default class PositionCache {
       }
     }
 
-    for (let k = low; k < count && tops[order[k]] === top; k++) {
+    for (let k = low; k < n; k++) {
       if (order[k] === index) {
-        return k;
+        order.copyWithin(k, k + 1, n);
+        this._colItemCounts[c] = n - 1;
+        return;
+      }
+      if (tops[order[k]] !== top) {
+        break;
       }
     }
-
-    return -1;
   }
 
-  _ensureCapacity(needed: number) {
+  _ensureCapacity(minCapacity: number): void {
     const capacity = this._capacity;
-    // `_order` must be able to hold one entry per positioned cell; cells are
-    // indexed directly, so capacity is driven by the largest index.
-    if (needed <= capacity) {
+    if (minCapacity <= capacity) {
       return;
     }
 
-    const newCapacity = Math.max(needed, capacity * 2, MIN_CAPACITY);
+    let newCapacity = capacity > 0 ? capacity << 1 : MIN_CAPACITY;
+    if (newCapacity < minCapacity) {
+      newCapacity = minCapacity;
+    }
 
     const tops = new Float64Array(newCapacity);
     const lefts = new Float64Array(newCapacity);
     const heights = new Float64Array(newCapacity);
     const flags = new Uint8Array(newCapacity);
-    const order = new Uint32Array(newCapacity);
 
     if (capacity > 0) {
       tops.set(this._tops);
       lefts.set(this._lefts);
       heights.set(this._heights);
       flags.set(this._flags);
-      order.set(this._order);
     }
 
     this._tops = tops;
     this._lefts = lefts;
     this._heights = heights;
     this._flags = flags;
-    this._order = order;
     this._capacity = newCapacity;
   }
 }

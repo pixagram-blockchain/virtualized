@@ -1,7 +1,6 @@
 /** @flow */
 import PropTypes from 'prop-types';
 import * as React from 'react';
-import {polyfill} from 'react-lifecycles-compat';
 import CellMeasurerCacheDecorator from './CellMeasurerCacheDecorator';
 import Grid from '../Grid';
 
@@ -815,6 +814,5 @@ class MultiGrid extends React.PureComponent {
   };
 }
 
-polyfill(MultiGrid);
 
 export default MultiGrid;

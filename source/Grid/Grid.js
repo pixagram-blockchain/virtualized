@@ -29,7 +29,6 @@ import defaultOverscanIndicesGetter, {
 import updateScrollIndexHelper from './utils/updateScrollIndexHelper';
 import defaultCellRangeRenderer from './defaultCellRangeRenderer';
 import scrollbarSize from 'dom-helpers/scrollbarSize';
-import {polyfill} from 'react-lifecycles-compat';
 import {
   requestAnimationTimeout,
   cancelAnimationTimeout,
@@ -555,6 +554,37 @@ class Grid extends React.PureComponent<Props, State> {
 
     // Clear cell cache in case we are scrolling;
     // Invalid row heights likely mean invalid cached content as well.
+    this._styleCache = {};
+    this._cellCache = {};
+
+    this.forceUpdate();
+  }
+
+  /**
+   * Point-update variant of recomputeGridSize for the case where a single
+   * cell changed size but all other cells kept their identity (e.g. a
+   * CellMeasurer re-measure). Patches downstream offsets in O(log n)
+   * instead of invalidating and re-asking the size getters for the whole
+   * suffix. For row/column insertions or removals use recomputeGridSize.
+   */
+  recomputeCellSize({columnIndex = 0, rowIndex = 0}: CellPosition = {}) {
+    const {scrollToColumn, scrollToRow} = this.props;
+    const {instanceProps} = this.state;
+
+    instanceProps.columnSizeAndPositionManager.resizeCell(columnIndex);
+    instanceProps.rowSizeAndPositionManager.resizeCell(rowIndex);
+
+    this._recomputeScrollLeftFlag =
+      scrollToColumn >= 0 &&
+      (this.state.scrollDirectionHorizontal === SCROLL_DIRECTION_FORWARD
+        ? columnIndex <= scrollToColumn
+        : columnIndex >= scrollToColumn);
+    this._recomputeScrollTopFlag =
+      scrollToRow >= 0 &&
+      (this.state.scrollDirectionVertical === SCROLL_DIRECTION_FORWARD
+        ? rowIndex <= scrollToRow
+        : rowIndex >= scrollToRow);
+
     this._styleCache = {};
     this._cellCache = {};
 
@@ -1644,5 +1674,4 @@ class Grid extends React.PureComponent<Props, State> {
   };
 }
 
-polyfill(Grid);
 export default Grid;

@@ -1,8 +1,8 @@
 # Modernization: CellMeasurer, Masonry, utils
 
-TypedArray-backed rewrites with identical public APIs. All 257 original
-jest tests pass unchanged (CellMeasurer, Masonry, utils, and the full Grid
-suite); randomized differential testing (old vs new, thousands
+TypedArray-backed rewrites plus algorithmic and React-layer upgrades. The
+full original jest tree passes (568 tests across all 27 suites; one
+assertion adapted, noted below); randomized differential testing (old vs new, thousands
 of operations) confirms observable-behavior parity, including documented
 quirks. Verified on React 17 and React 18 (createRoot), plus a simulated
 React 19 environment (no `ReactDOM.findDOMNode`).
@@ -65,6 +65,27 @@ The engine under Grid, List, Table, MultiGrid and InfiniteLoader.
   `_lastMeasuredIndex`/`_lastBatchedIndex` progression, and — strongest —
   identical `cellSizeGetter` call sequences across thousands of mixed
   operations in both fully-measured and deferred (CellMeasurer) modes.
+- **New: `resizeCell(index)` point updates (Fenwick delta tree).** For the
+  case where one cell changed size but every other cell kept its identity
+  (a CellMeasurer re-measure), `resizeCell` re-asks the getter for that
+  single cell and patches all downstream offsets in O(log n) via a binary
+  indexed tree of pending corrections, instead of invalidating and
+  re-asking the whole suffix. While no corrections are pending, every
+  offset read keeps the original fast path (one extra compare); pending
+  corrections add an O(log n) prefix to reads until they are folded back
+  into the absolute offsets by a single O(n) rebase, which runs lazily
+  before any structural change (`resetCell` or a sequential fill
+  extension). `resetCell` itself keeps its documented suffix-invalidation
+  semantics verbatim — insertions and removals must still use it.
+  Ground-truth tested against brute-force prefix sums across thousands of
+  mixed operations, and proven to converge to exactly the same state as
+  the suffix path.
+- `ScalingCellSizeAndPositionManager` forwards `resizeCell`. Grid gains
+  `recomputeCellSize({columnIndex, rowIndex})` — the point-update twin of
+  `recomputeGridSize` — and CellMeasurer prefers it when the parent
+  exposes it. Net effect: a re-measured cell near the top of a 100k-row
+  list while scrolled near the bottom costs ~1 µs instead of ~707 µs (and
+  no longer re-invokes the size getter 100k times).
 - Quirk preserved: a run of cells filled toward a target index sets
   `_lastMeasuredIndex`/`_lastBatchedIndex` to the *target* index per
   branch, exactly as the original loop did.
@@ -75,13 +96,16 @@ The engine under Grid, List, Table, MultiGrid and InfiniteLoader.
 
 ## Masonry/PositionCache.js
 
-- The interval tree is replaced by parallel `Float64Array`s
-  (top/left/height) plus a `Uint32Array` of cell indices kept sorted by top.
-  Masonry appends mostly-increasing tops, so inserts are O(1) amortized;
-  out-of-order inserts use binary insertion.
-- `range()` does a binary lower-bound on `scrollTop - maxCellHeight` and a
-  short linear scan — visits cells in ascending-top order (the tree's order
-  differed; Masonry's output is order-independent because keys are stable).
+- A masonry layout is a set of independent column stacks, so the cache keeps
+  one top-sorted Uint32Array of cell indices per column instead of one
+  global geometry structure. Inserts are O(1) amortized appends per column;
+  rare out-of-order inserts move memory within one column only.
+- `range()` binary-searches each column independently and walks the
+  per-column band `[scrollTop - columnMaxCellHeight, hi]` — output-sensitive
+  O(columns * log n + reported), and one giant cell only widens the
+  candidate band of its own column. Cells are reported column by column in
+  ascending-top order (the original tree's order differed; Masonry's output
+  is order-independent because keys are stable).
 - `shortestColumnSize`/`tallestColumnSize` are cached with lazy
   recomputation (original did a `for...in` object scan per access — these
   are read on every render/scroll). Original min/max formulas preserved,
@@ -102,10 +126,29 @@ The engine under Grid, List, Table, MultiGrid and InfiniteLoader.
 - `vendor/intervalTree.js` and `vendor/binarySearchBounds.js` are left in
   place for external deep-importers but are no longer used internally.
 
-## Masonry/Masonry.js
+## Masonry/Masonry.js — React-layer rendering upgrades
 
+- **Range-gated rendering.** Scroll events no longer call `setState`
+  unconditionally. The handler recomputes the overscanned cell range (a
+  position-cache walk, sub-microsecond) and re-renders only when the range
+  changed, a measurement batch is needed, or `isScrolling` must flip on.
+  Offsets within the current range scroll natively — absolutely-positioned
+  cells inside the fixed-height inner container need no React work — so
+  render frequency drops from event-rate (~60/s) to range crossings. The
+  `onScroll` prop still fires for every distinct offset (now directly from
+  the handler, memoized as before), and `onCellsRendered` semantics are
+  unchanged (it was already memoized on indices).
+- **Element cache while scrolling.** Mirroring Grid's `_cellCache`: during
+  `isScrolling`, rendered cell elements are reused by key, so a render
+  caused by a range change invokes `cellRenderer` only for cells entering
+  the window; scrolling back over a previous range invokes it zero times.
+  The cache clears exactly when the scroll burst ends and on every
+  position/style invalidation. One shipped test asserted exact
+  `cellRenderer` call counts as a proxy for "measured cells must not leave
+  the DOM" (issue #875); the assertion was adapted to test that intent
+  directly, which the element cache preserves by construction.
 - Native `getDerivedStateFromProps`; the `react-lifecycles-compat` polyfill
-  import is dropped (other components still using it are untouched).
+  import is dropped.
 - Per-cell style objects are cached (`Map<index, style>`), so unchanged
   cells receive referentially-stable `style` props across renders — enabling
   `React.memo`/`PureComponent` bailouts in cell renderers. The cache is
@@ -135,6 +178,13 @@ The engine under Grid, List, Table, MultiGrid and InfiniteLoader.
   `{size, offset}` objects and exact error message.
 - `getUpdatedOffsetForIndex.js`, `requestAnimationTimeout.js`: unchanged
   (already optimal).
+
+## React modernization sweep
+
+`react-lifecycles-compat` is removed from Grid, ArrowKeyStepper,
+CollectionView and MultiGrid (Masonry already had it removed); all use
+native `getDerivedStateFromProps`. The library no longer imports the
+polyfill anywhere.
 
 ## Compatibility notes
 

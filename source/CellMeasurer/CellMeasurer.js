@@ -18,6 +18,7 @@ type Props = {
   parent: {
     invalidateCellSizeAfterRender?: (cell: Cell) => void,
     recomputeGridSize?: (cell: Cell) => void,
+    recomputeCellSize?: (cell: Cell) => void,
   },
   rowIndex?: number,
 };
@@ -170,7 +171,15 @@ export default class CellMeasurer extends React.PureComponent<Props> {
     ) {
       cache.set(rowIndex, columnIndex, width, height);
 
-      if (parent && typeof parent.recomputeGridSize === 'function') {
+      if (parent && typeof parent.recomputeCellSize === 'function') {
+        // Point update: only this cell changed size, so downstream offsets
+        // can be patched without re-asking the size getter for every
+        // later cell.
+        parent.recomputeCellSize({
+          columnIndex,
+          rowIndex,
+        });
+      } else if (parent && typeof parent.recomputeGridSize === 'function') {
         parent.recomputeGridSize({
           columnIndex,
           rowIndex,

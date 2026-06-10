@@ -49,6 +49,16 @@ export default class CellSizeAndPositionManager {
   _sizes: Float64Array = EMPTY_F64;
   _capacity = 0;
 
+  // Point-resize support (see resizeCell): pending offset corrections are
+  // held in a Fenwick (binary indexed) tree keyed by threshold cell index —
+  // a correction with threshold t applies to the offsets of all cells with
+  // index >= t. `_deltaRaw` mirrors the same corrections in flat per-
+  // threshold form so a rebase folds them into `_offsets` in one O(n) pass.
+  // While `_deltaCount` is 0 every offset read takes the original fast path.
+  _deltaTree: Float64Array = EMPTY_F64;
+  _deltaRaw: Float64Array = EMPTY_F64;
+  _deltaCount = 0;
+
   // Measurements for cells up to this index can be trusted; cells afterward should be estimated.
   _lastMeasuredIndex = -1;
 
@@ -109,7 +119,7 @@ export default class CellSizeAndPositionManager {
     this._fill(index);
 
     return {
-      offset: this._offsets[index],
+      offset: this._offsetOf(index),
       size: this._sizes[index],
     };
   }
@@ -118,7 +128,7 @@ export default class CellSizeAndPositionManager {
     const last = this._lastMeasuredIndex;
     return last >= 0
       ? {
-          offset: this._offsets[last],
+          offset: this._offsetOf(last),
           size: this._sizes[last],
         }
       : {
@@ -135,7 +145,7 @@ export default class CellSizeAndPositionManager {
   getTotalSize(): number {
     const last = this._lastMeasuredIndex;
     const totalSizeOfMeasuredCells =
-      last >= 0 ? this._offsets[last] + this._sizes[last] : 0;
+      last >= 0 ? this._offsetOf(last) + this._sizes[last] : 0;
     const numUnmeasuredCells = this._cellCount - last - 1;
     const totalSizeOfUnmeasuredCells =
       numUnmeasuredCells * this._estimatedCellSize;
@@ -202,7 +212,7 @@ export default class CellSizeAndPositionManager {
     const start = this._findNearestCell(offset);
 
     this._probe(start);
-    offset = this._offsets[start] + this._sizes[start];
+    offset = this._offsetOf(start) + this._sizes[start];
 
     let stop = start;
     const stopLimit = this._cellCount - 1;
@@ -226,7 +236,95 @@ export default class CellSizeAndPositionManager {
    * It will not immediately perform any calculations; they'll be performed the next time getSizeAndPositionOfCell() is called.
    */
   resetCell(index: number): void {
+    if (this._deltaCount > 0) {
+      this._rebase();
+    }
     this._lastMeasuredIndex = Math.min(this._lastMeasuredIndex, index - 1);
+  }
+
+  /**
+   * Point update: cell `index` changed size but every other cell kept its
+   * identity (the CellMeasurer re-measure case). Re-asks the size getter
+   * for that single cell and patches all downstream offsets in O(log n)
+   * via the delta tree — unlike resetCell, which invalidates the whole
+   * suffix and re-asks the getter for every later cell.
+   *
+   * Only valid when sizes are index-stable; for row/column insertions or
+   * removals use resetCell.
+   */
+  resizeCell(index: number): void {
+    if (index < 0 || index >= this._cellCount) {
+      return;
+    }
+    if (index > this._lastMeasuredIndex) {
+      // Not measured yet; the next lazy fill will ask the getter anyway.
+      return;
+    }
+
+    let size = this._cellSizeGetter({index});
+
+    if (size === undefined || isNaN(size)) {
+      throw Error(`Invalid size returned for cell ${index} of value ${size}`);
+    } else if (size === null) {
+      size = 0;
+      this._lastBatchedIndex = index;
+    }
+
+    const delta = size - this._sizes[index];
+    if (delta === 0) {
+      return;
+    }
+    this._sizes[index] = size;
+
+    // Corrections apply to offsets of cells with index >= index + 1.
+    const threshold = index + 1;
+    const tree = this._deltaTree;
+    const n = tree.length - 1;
+    if (threshold <= n - 1) {
+      this._deltaRaw[threshold] += delta;
+      for (let j = threshold + 1; j <= n; j += j & -j) {
+        tree[j] += delta;
+      }
+      this._deltaCount++;
+    }
+    // threshold beyond the last cell only affects total size, which reads
+    // sizes[last] directly.
+  }
+
+  // Sum of pending corrections applying to cell `index`
+  // (all thresholds <= index; tree position = threshold + 1).
+  _deltaPrefix(index: number): number {
+    const tree = this._deltaTree;
+    let sum = 0;
+    for (let j = index + 1; j > 0; j -= j & -j) {
+      sum += tree[j];
+    }
+    return sum;
+  }
+
+  _offsetOf(index: number): number {
+    const offset = this._offsets[index];
+    return this._deltaCount === 0 ? offset : offset + this._deltaPrefix(index);
+  }
+
+  // Folds pending corrections into the absolute offsets (single O(n) pass
+  // over the raw per-threshold deltas) and empties the tree. Runs lazily
+  // before any structural change: a sequential fill extension or a
+  // resetCell.
+  _rebase(): void {
+    const offsets = this._offsets;
+    const raw = this._deltaRaw;
+    const last = this._lastMeasuredIndex;
+
+    let acc = 0;
+    for (let i = 0; i <= last; i++) {
+      acc += raw[i];
+      offsets[i] += acc;
+    }
+
+    raw.fill(0);
+    this._deltaTree.fill(0);
+    this._deltaCount = 0;
   }
 
   /**
@@ -248,6 +346,10 @@ export default class CellSizeAndPositionManager {
   _fill(index: number): void {
     if (index <= this._lastMeasuredIndex) {
       return;
+    }
+
+    if (this._deltaCount > 0) {
+      this._rebase();
     }
 
     this._ensureCapacity(index + 1);
@@ -300,6 +402,10 @@ export default class CellSizeAndPositionManager {
     }
     this._offsets = newOffsets;
     this._sizes = newSizes;
+    // Growth only happens from _fill, which rebases first, so the delta
+    // structures are guaranteed empty: fresh zeroed allocations suffice.
+    this._deltaTree = new Float64Array(newCapacity + 2);
+    this._deltaRaw = new Float64Array(newCapacity + 2);
     this._capacity = newCapacity;
   }
 
@@ -308,7 +414,7 @@ export default class CellSizeAndPositionManager {
       const middle = low + ((high - low) >>> 1);
       // _probe can reallocate the backing arrays, so read through `this`.
       this._probe(middle);
-      const currentOffset = this._offsets[middle];
+      const currentOffset = this._offsetOf(middle);
 
       if (currentOffset === offset) {
         return middle;
@@ -332,7 +438,7 @@ export default class CellSizeAndPositionManager {
 
     while (index < cellCount) {
       this._probe(index);
-      if (this._offsets[index] >= offset) {
+      if (this._offsetOf(index) >= offset) {
         break;
       }
       index += interval;
@@ -362,7 +468,9 @@ export default class CellSizeAndPositionManager {
     offset = Math.max(0, offset);
 
     const lastMeasuredOffset =
-      this._lastMeasuredIndex >= 0 ? this._offsets[this._lastMeasuredIndex] : 0;
+      this._lastMeasuredIndex >= 0
+        ? this._offsetOf(this._lastMeasuredIndex)
+        : 0;
     const lastMeasuredIndex = Math.max(0, this._lastMeasuredIndex);
 
     if (lastMeasuredOffset >= offset) {
